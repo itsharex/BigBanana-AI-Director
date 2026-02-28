@@ -1,5 +1,5 @@
 import { ProjectState } from '../types';
-import { isOpfsVideoRef, isVideoDataUrl, resolveVideoToBlob } from './videoStorageService';
+import { dataUrlToBlob, isOpfsVideoRef, isVideoDataUrl, resolveVideoToBlob } from './videoStorageService';
 import { fetchMediaWithCorsFallback } from './mediaFetchService';
 
 type ProgressReporter = (phase: string, progress: number) => void;
@@ -69,6 +69,28 @@ const createProjectTitle = (project: ProjectState): string => (
   project.scriptData?.title || project.title || 'master'
 );
 
+const inferDubbingExtension = (shot: ProjectState['shots'][number]): 'wav' | 'mp3' => {
+  const configured = shot.dubbing?.outputFormat;
+  if (configured === 'wav' || configured === 'mp3') {
+    return configured;
+  }
+
+  const audioUrl = shot.dubbing?.audioUrl || '';
+  const lower = audioUrl.toLowerCase();
+  if (lower.startsWith('data:audio/mpeg') || lower.startsWith('data:audio/mp3')) {
+    return 'mp3';
+  }
+  if (lower.startsWith('data:audio/wav') || lower.startsWith('data:audio/x-wav')) {
+    return 'wav';
+  }
+
+  const extMatch = lower.match(/\.([a-z0-9]{2,4})(?:$|\?)/);
+  if (extMatch?.[1] === 'mp3') return 'mp3';
+  if (extMatch?.[1] === 'wav') return 'wav';
+
+  return 'wav';
+};
+
 /**
  * Download one media input and normalize it to Blob.
  * Supports remote URL, data URL, and OPFS-backed references.
@@ -77,18 +99,17 @@ async function downloadFile(urlOrBase64: string): Promise<Blob> {
   if (isVideoDataUrl(urlOrBase64) || isOpfsVideoRef(urlOrBase64)) {
     return resolveVideoToBlob(urlOrBase64);
   }
-  // Handle inline video data URL.
-  if (urlOrBase64.startsWith('data:video/')) {
-    // Decode base64 payload from data URL.
-    const base64Data = urlOrBase64.split(',')[1];
-    const binaryString = atob(base64Data);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
+  if (urlOrBase64.startsWith('data:')) {
+    try {
+      return dataUrlToBlob(urlOrBase64);
+    } catch {
+      const fallbackResponse = await fetch(urlOrBase64);
+      if (!fallbackResponse.ok) {
+        throw new Error(`Download failed: ${fallbackResponse.statusText}`);
+      }
+      return await fallbackResponse.blob();
     }
-    return new Blob([bytes], { type: 'video/mp4' });
   }
-  
   // Download from remote URL (with dev-time CORS fallback).
   const response = await fetchMediaWithCorsFallback(urlOrBase64);
   if (!response.ok) {
@@ -537,6 +558,15 @@ export async function downloadSourceAssets(
           assets.push({
             url: shot.interval.videoUrl,
             path: `videos/shot_${shotNum}.mp4`
+          });
+        }
+
+        // 5. Shot dubbing audio.
+        if (shot.dubbing?.audioUrl) {
+          const audioExt = inferDubbingExtension(shot);
+          assets.push({
+            url: shot.dubbing.audioUrl,
+            path: `dubbing/shot_${shotNum}.${audioExt}`
           });
         }
       }
